@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,23 +15,27 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/songgao/water"
+	"github.com/vishvananda/netlink"
 )
 
 // #############################
 // 定数
 // #############################
 const (
-	Protocol       = "tcp"              // VPN通信に利用するプロトコル
-	BuffSize       = 1500               //パケットの読み取り用バッファサイズ (MTUを参照)
-	MetricValue    = "50"               // メトリック値
-	ResolvConfPath = "/etc/resolv.conf" // NameServerの設定ファイルのパス
-	DevNullPath    = "/dev/null"        // 標準出力と標準エラー出力の両方共を破棄する
-	DNSResolver    = "resolvectl"       // 名前解決サービス
+	Protocol               = "tcp"              // VPN通信に利用するプロトコル
+	BuffSize               = 1500               //パケットの読み取り用バッファサイズ (MTUを参照)
+	MetricValue            = "50"               // メトリック値
+	ResolvConfPath         = "/etc/resolv.conf" // NameServerの設定ファイルのパス
+	DevNullPath            = "/dev/null"        // 標準出力と標準エラー出力の両方共を破棄する
+	DNSResolver            = "resolvectl"       // 名前解決サービス
+	DefaultRouteFirstHalf  = "0.0.0.0/1"        // 全IPアドレス空間の前半半分 (0.0.0.0 - 127.255.255.255)
+	DefaultRouteSecondHalf = "128.0.0.0/1"      // 全IPアドレス空間の後半半分 (128.0.0.0 - 255.255.255.255)
 )
 
 // #############################
@@ -82,6 +88,12 @@ func main() {
 	// CLI画面をクリアにする。
 	fmt.Print("\033c")
 
+	// VPN通信で使うインターフェースを選択する。
+	ifaceName, err := selectionLANInterfaceForVPNConnection()
+	if err != nil {
+		log.Fatal("failed to get for selected interface: ", err)
+	}
+
 	// TLS接続を確立する。
 	dest := fmt.Sprintf("%s:%s", *svrIP, *port)
 	tlsConn, err := setupTLSconnection(dest)
@@ -101,7 +113,7 @@ func main() {
 	}
 
 	// JSON形式で受信した設定情報を基に、TUNインターフェースを作成および設定を行う。
-	tunIface, originalPath, backupPath, err := setupTUN(recvConf.IP, recvConf.CIDR)
+	tunIface, defaultGateway, vpnIPMask, originalPath, backupPath, err := setupTUN(recvConf.IP, recvConf.CIDR, ifaceName)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -123,6 +135,7 @@ func main() {
 
 	// 終了処理
 	cancel()
+	cleanupDefaultRoute(tunIface, defaultGateway, vpnIPMask)
 	tlsConn.Close()
 	tunIface.Close()
 	wg.Wait()
@@ -249,15 +262,15 @@ func setupTLSconnection(dest string) (*tls.Conn, error) {
 
 // VPN通信の出入り口として仮想インターフェース(TUNデバイス)を作成する。
 // OSレベル(カーネル空間)での設定を行う。
-func setupTUN(ipAddr string, cidr int) (*water.Interface, string, string, error) {
+func setupTUN(ipAddr string, cidr int, ifaceName string) (*water.Interface, string, string, string, string, error) {
 	// 動的IPアドレスを設定する。
 	dynamicIP := fmt.Sprintf("%s/%d", ipAddr, cidr)
 	log.Printf("Set TUNinterface IPAddr: %s", dynamicIP)
 
 	// TUNインターフェースの作成と作成したTUNインターフェースのデフォルトルートの設定を行う。
-	tunIface, err := setupIface(dynamicIP)
+	tunIface, defaultGateway, vpnIPMask, err := setupIface(dynamicIP, ifaceName)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to create tun interface: %w", err)
+		return nil, "", "", "", "", fmt.Errorf("failed to create tun interface: %w", err)
 	}
 
 	// デフォルトゲートルートを設定したTUNデバイスに、DNSサーバを割り当てる。
@@ -265,14 +278,14 @@ func setupTUN(ipAddr string, cidr int) (*water.Interface, string, string, error)
 	originalPath, backupPath, err := setupDNS(tunIface)
 	if err != nil {
 		tunIface.Close()
-		return nil, "", "", fmt.Errorf("failed to processing the setup dns: %w", err)
+		return nil, "", "", "", "", fmt.Errorf("failed to processing the setup dns: %w", err)
 	}
 
-	return tunIface, originalPath, backupPath, nil
+	return tunIface, defaultGateway, vpnIPMask, originalPath, backupPath, nil
 }
 
 // 新規のTUNインターフェースを作成する
-func setupIface(dynamicIP string) (*water.Interface, error) {
+func setupIface(dynamicIP string, ifaceName string) (*water.Interface, string, string, error) {
 	// TUNデバイスの作成に必要なパラメータを定義する。
 	// 定義した「conf」を基に、カーネル空間に新しいTUNデバイスを作成する。
 	// 作成したTUNデバイスは、カーネル空間とユーザ空間で連携するための窓口となる。
@@ -280,28 +293,189 @@ func setupIface(dynamicIP string) (*water.Interface, error) {
 	conf.Name = *tunName
 	tunIface, err := water.New(conf)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create new tun/tap interface: %w", err)
+		return nil, "", "", fmt.Errorf("failed to create new tun/tap interface: %w", err)
 	}
 
 	// OSの基本的な機能のipコマンドを呼び出し、カーネル空間に作成したTUNデバイスに、IPアドレスとサブネット(CIDR表記)を割り当てる。
 	if err := exec.Command("ip", "addr", "add", dynamicIP, "dev", tunIface.Name()).Run(); err != nil {
 		tunIface.Close()
-		return nil, fmt.Errorf("create tun interface failed: %w", err)
+		return nil, "", "", fmt.Errorf("failed to create new tun interfacae: %w", err)
 	}
 
 	// 割り当てたTUNデバイスを有効化し、パケットの送受信を可能にする。
 	if err := exec.Command("ip", "link", "set", tunIface.Name(), "up").Run(); err != nil {
 		tunIface.Close()
-		return nil, fmt.Errorf("tun interface configuration failed: %w", err)
+		return nil, "", "", fmt.Errorf("failed to configuration to tun interface: %w", err)
 	}
 
 	// 既存のデフォルトルートより優先度の高いメトリックで、新しくTUNインターフェースのデフォルトルートを追加する。
 	if err := exec.Command("ip", "route", "add", "default", "dev", tunIface.Name(), "metric", MetricValue).Run(); err != nil {
 		tunIface.Close()
-		return nil, fmt.Errorf(": %w", err)
+		return nil, "", "", fmt.Errorf("failed to add the default route for the new tun interface: %w", err)
 	}
 
-	return tunIface, nil
+	// VPNサーバーへの例外ルートを追加する。
+	vpnIPMask := *svrIP + "/32"
+	defaultGateway, err := getDefaultGatewayForInterface(ifaceName)
+	if err != nil {
+		tunIface.Close()
+		return nil, "", "", fmt.Errorf("failed to get default gateway: %w", err)
+	}
+	if err := exec.Command("ip", "route", "add", vpnIPMask, "via", defaultGateway).Run(); err != nil {
+		tunIface.Close()
+		return nil, "", "", fmt.Errorf("failed to add routing for the vpn server: %w", err)
+	}
+
+	// デフォルトルートをVPNトンネルに向ける
+	// プレフィックス長一致の原則を利用し、既存のデフォルトルートを上書きする
+	if err := exec.Command("ip", "route", "add", DefaultRouteFirstHalf, "dev", tunIface.Name()).Run(); err != nil {
+		tunIface.Close()
+		return nil, "", "", fmt.Errorf("failed to add routing the first half of the entire ip address space: %w", err)
+	}
+	if err := exec.Command("ip", "route", "add", DefaultRouteSecondHalf, "dev", tunIface.Name()).Run(); err != nil {
+		tunIface.Close()
+		return nil, "", "", fmt.Errorf("failed to add routing the latter half of the entire ip address space: %w", err)
+	}
+
+	return tunIface, defaultGateway, vpnIPMask, nil
+}
+
+// VPN通信用の通信を追加するために、デフォルトゲートウェイを取得する。
+func getDefaultGatewayForInterface(ifaceName string) (string, error) {
+	// 指定したインターフェースの情報を取得する
+	targetIfaceLink, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return "", fmt.Errorf("interface %s not found: %w", ifaceName, err)
+	}
+	targetIfaceLinkIndex := targetIfaceLink.Attrs().Index
+
+	// システム内のルート一覧を取得する。
+	// Linuxコマンドの「ip route show」にあたる。
+	routeLists, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return "", fmt.Errorf("failed to get route list: %w", err)
+	}
+
+	// デフォルトゲートウェイのIPアドレスを取得する
+	for _, routeList := range routeLists {
+		if determineDefaultGateway(routeList.Dst) && routeList.Gw != nil && routeList.LinkIndex == targetIfaceLinkIndex {
+			return routeList.Gw.String(), nil
+		}
+	}
+
+	// 対象のインターフェースがない場合の処理
+	return "", fmt.Errorf("no default gateway fof target interface %s", ifaceName)
+}
+
+// VPN通信で使うインターフェースを選択する。
+func selectionLANInterfaceForVPNConnection() (string, error) {
+	var selectionIface string
+
+	// VPN通信で使うインターフェースを選択するために、全インターフェースの情報を取得する。
+	linkLists, err := netlink.LinkList()
+	if err != nil {
+		return "", fmt.Errorf("failed to get to all interface infomation: %w", err)
+	}
+
+	ifaces := make([]string, len(linkLists))
+	fmt.Println()
+	for {
+		fmt.Println("--------------------------------")
+		fmt.Println(" # TLS接続で利用するLANインターフェースを選択してください")
+		// 取得してきた利用可能なインターフェースをリスト番号で選択させる。
+		for index, linkList := range linkLists {
+			ifaces[index] = linkList.Attrs().Name
+			fmt.Printf(" [%d] %s\n", index+1, linkList.Attrs().Name)
+		}
+		fmt.Println("--------------------------------")
+		fmt.Print(" リスト番号: ")
+		userInputValue, err := askForUserInput()
+		if err != nil {
+			return "", err
+		}
+
+		// 入力値(リスト番号) の先頭と末尾の空白があれば取り除き、文字列から数値に型変換する。
+		// 入力値がインターフェース一覧の件数より多いか少ないかを検証する。
+		// 問題がなければ、後続処理に進み、入力値が無効な場合は、再度入力を実施する。
+		listValue, err := strconv.Atoi(strings.TrimSpace(userInputValue))
+		if err != nil || listValue < 1 || listValue > len(ifaces) {
+			fmt.Print("\033c") // CLI画面をクリアにする。
+			fmt.Println()
+			fmt.Println(" 入力した値は無効な値です")
+			fmt.Println(" リスト番号にある番号を入力してください")
+			continue
+		}
+		// 有効なリスト番号が選択された場合、インターフェース名とIPv4アドレスの情報を保持する。
+		selectionIface = ifaces[listValue-1]
+		return selectionIface, nil
+	}
+}
+
+// ユーザの入力を待つ
+func askForUserInput() (string, error) {
+	inputChan := make(chan string)    // ユーザ入力を受け取る
+	errMsgChan := make(chan error, 1) // 致命的なエラーを受け取るためのチャネル
+
+	// 「Ctrl+C (SIGINT)」などのOSシグナルを待機するためのチャネルを設定。
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// main関数のシグナルに戻す
+	defer func() {
+		signal.Stop(sigChan)
+		close(sigChan)
+	}()
+
+	// ユーザからの入力を判別し、標準入力以外は処理を終了する。
+	go func() {
+		// 標準入力の値を受け付ける。
+		scanner := bufio.NewScanner(os.Stdin)
+
+		// 「scanner.Scan()」で、入力待ちで処理をブロックしている。
+		// EOF と I/Oエラーのどちらかを判別する。
+		if !scanner.Scan() {
+			err := scanner.Err()
+			// nilの場合、「EOF」
+			if err == nil {
+				err = fmt.Errorf("input interrupted")
+			}
+			errMsgChan <- err
+			return
+		}
+		// 標準入力した値(リスト番号) を取得する。
+		inputChan <- scanner.Text()
+	}()
+
+	select {
+	//　ユーザの標準入力
+	case input := <-inputChan:
+		return input, nil
+	// 入力処理でエラー発生
+	case err := <-errMsgChan:
+		return "", err
+	// 「Ctrl+C」などのOSシグナルを受信
+	case <-sigChan:
+		return "", errors.New("os signal receive")
+	}
+}
+
+// routeLists で取得したルート一覧の宛先（Dst)の判定を行う
+func determineDefaultGateway(dst *net.IPNet) bool {
+	// 宛先（Dst)が nil の場合の処理
+	if dst == nil {
+		return true
+	}
+
+	// 宛先（Dst)が 0.0.0.0/0 の場合の処理
+	// ルーティングエントリの宛先IPアドレスが 0.0.0.0 か確認する。
+	// ルーティングエントリのサブネットマスク /0 か確認する。
+	dstIP := net.ParseIP("0.0.0.0").To4()
+	dstIPMask := net.IPv4Mask(0, 0, 0, 0)
+	if dst.IP.Equal(dstIP) && bytes.Equal(dst.Mask, dstIPMask) {
+		return true
+	}
+
+	return false
 }
 
 // TUNデバイスに、任意のDNサーバの割り当てる
@@ -402,6 +576,21 @@ func cleanupTUN(tunIface *water.Interface, originalPath, backupPath string) {
 	}
 
 	cleanupDNS(tunIface, originalPath, backupPath)
+}
+
+func cleanupDefaultRoute(tunIface *water.Interface, defaultGateway string, vpnIPMask string) {
+	if err := exec.Command("ip", "route", "delete", vpnIPMask, "via", defaultGateway).Run(); err != nil {
+		log.Printf("failed to delete routing for the vpn server")
+	}
+
+	// デフォルトルートをVPNトンネルに向ける
+	// プレフィックス長一致の原則を利用し、既存のデフォルトルートを上書きする
+	if err := exec.Command("ip", "route", "delete", DefaultRouteFirstHalf, "dev", tunIface.Name()).Run(); err != nil {
+		log.Printf("failed to delete routing the first half of the entire ip address space")
+	}
+	if err := exec.Command("ip", "route", "delete", DefaultRouteSecondHalf, "dev", tunIface.Name()).Run(); err != nil {
+		log.Printf("failed to delete routing the latter half of the entire ip address space")
+	}
 }
 
 // カーネル空間に作成したTUNインターフェースを削除する
